@@ -1,0 +1,1360 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>FATHOM — a sonar descent</title>
+<link rel="preconnect" href="https://api.fontshare.com">
+<link href="https://api.fontshare.com/v2/css?f[]=technor@400,500,700&display=swap" rel="stylesheet">
+<style>
+  html,body{margin:0;padding:0;height:100%;background:#02070a;overflow:hidden}
+  canvas{display:block;width:100vw;height:100vh;touch-action:none;cursor:crosshair}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* =====================================================================
+   FATHOM — sonar-only descent roguelite (MVP)
+   Single file on purpose.
+   All visuals procedural, all audio synthesized — no assets, ever.
+   ===================================================================== */
+
+/* ---------------- CONFIG — every tunable lives here ---------------- */
+const CFG = {
+  tile: 28,
+  mapW: 84, mapH: 64,          // base map size in tiles; grows with depth
+  fillProb: 0.46, smoothIters: 5,
+  playerR: 9, accel: 540, drag: 2.7, maxSpeed: 235,
+  pingSpeed: 470, pingMaxR: 680, pingCooldown: 0.9, pingRays: 280,
+  litFade: 0.4,                // lit contour fade per second
+  o2Max: 75, o2PerBubble: 20, bubbles: 7,
+  lurkersBase: 3, lurkerSpeed: 100, lurkerAlertSpeed: 172, lurkerR: 11,
+  alertTime: 5, senseR: 165,   // distance at which you faintly feel a lurker
+  hull: 3, iframes: 1.3,
+  noiseRadius: 150,            // full-thrust movement wakes lurkers this close
+  gateHumRange: 2200,         // gate hum audible within this (directional, pans to bearing)
+  // Phase 2 — consumables & pickups
+  flaresPerZone: 1, flareRadiusMul: 1.9,   // flare = double-reach ping that wakes the whole map
+  decoysPerZone: 1, decoyLife: 6.5, decoyPingEvery: 1.15,  // decoy pings from where it's dropped; lurkers mob it
+  hullPatchChance: 0.55,      // chance a zone contains one hull-patch pickup (restores 1 hull)
+  hullLightR: 74,             // dim, silent arm's-reach wall awareness around the sub (proximity, no aggro)
+  // Phase 3 — depth identity
+  listenerR: 250,             // ping inside this radius of a Listener = instant death; shown only by pings rippling wrong
+  listenerChance: 0.6,        // chance a Listener zone (biomes 2+) actually has one
+  ventStrength: 620, ventR: 150,          // current-vent push force & reach
+  brittleFallDelay: 1.15, brittleDmgR: 22, // brittle ceiling: ping-lit → rockfall after this delay
+};
+
+const TAU = Math.PI * 2;
+const COL = {
+  sonar: '53,242,212',
+  edge:  '121,255,229',
+  rock:  '34,110,102',
+  danger:'255,84,56',
+  gold:  '255,193,94',
+  hud:   '150,220,208',
+};
+const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+/* ---------------- STATE ---------------- */
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+let W = 0, H = 0, dpr = 1;
+let state = 'title';           // 'title' | 'play' | 'dead'
+let paused = false;
+let level = 1, o2 = 0, hull = 0, iframeT = 0, cdT = 0;
+let levelT = 0, msgT = 0, flashT = 0, deathT = 0, warnT = 0, noiseT = 0, hitstop = 0, lWarnT = 0;
+let titlePingT = 0, autoPinged = false, pingsUsed = 0;
+let deathCause = '', newBest = false;
+let flares = 0, decoys = 0;    // consumables in stock this zone
+let modName = '', modDesc = ''; // per-zone modifier shown on the banner
+let biome = null;              // current biome (palette + params), set in genLevel
+let logText = '', logT = 0;    // sonar-log flavor line shown on descent
+let listener = null;           // {x,y,r} stationary insta-kill-on-ping presence, or null
+let vents = [], rockfalls = [];// current vents (push), active brittle collapses
+let brittleCells = new Set();  // grid indices of brittle ceilings; lighting one drops rock
+let bestDepth = +(localStorage.getItem('fathom_best') || 0);
+let TIME = 0;
+
+let grid, gw, gh, distMap, spawn, gatePos;
+const cam = { x: 0, y: 0 };
+let shake = 0;
+let player = { x: 0, y: 0, vx: 0, vy: 0 };
+let lurkers = [], bubbles = [], pings = [], pops = [], wake = [], snow = [];
+let patches = [], decoyList = [];   // hull-patch pickups, active decoy pingers
+let gateEcho = null;           // {ang, t} sonar bearing return, set on a player ping
+const litCells = new Map();    // tileIndex -> intensity 0..1
+
+const keys = { w: 0, a: 0, s: 0, d: 0 };
+const KEYMAP = { KeyW:'w', ArrowUp:'w', KeyA:'a', ArrowLeft:'a',
+                 KeyS:'s', ArrowDown:'s', KeyD:'d', ArrowRight:'d' };
+
+/* ---------------- UTILS ---------------- */
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const lerp = (a, b, t) => a + (b - a) * t;
+const dist = (x1, y1, x2, y2) => Math.hypot(x2 - x1, y2 - y1);
+const T = CFG.tile;
+
+function isWallCell(gx, gy) {
+  if (gx < 0 || gy < 0 || gx >= gw || gy >= gh) return true;
+  return !!grid[gy * gw + gx];
+}
+function isWallPx(px, py) { return isWallCell((px / T) | 0, (py / T) | 0); }
+function cellIdx(px, py) {
+  const gx = (px / T) | 0, gy = (py / T) | 0;
+  if (gx < 0 || gy < 0 || gx >= gw || gy >= gh) return -1;
+  return gy * gw + gx;
+}
+function circleBlocked(x, y, r) {
+  const x0 = ((x - r) / T) | 0, x1 = ((x + r) / T) | 0;
+  const y0 = ((y - r) / T) | 0, y1 = ((y + r) / T) | 0;
+  for (let gy = y0; gy <= y1; gy++) for (let gx = x0; gx <= x1; gx++) {
+    if (gx < 0 || gy < 0 || gx >= gw || gy >= gh) return true;
+    if (!grid[gy * gw + gx]) continue;
+    const nx = clamp(x, gx * T, gx * T + T), ny = clamp(y, gy * T, gy * T + T);
+    if ((x - nx) ** 2 + (y - ny) ** 2 < r * r) return true;
+  }
+  return false;
+}
+function moveCollide(e, r, dt) {
+  const nx = e.x + e.vx * dt;
+  if (circleBlocked(nx, e.y, r)) e.vx *= -0.15; else e.x = nx;
+  const ny = e.y + e.vy * dt;
+  if (circleBlocked(e.x, ny, r)) e.vy *= -0.15; else e.y = ny;
+}
+// Wall-feeler steering: cast a whisker along the desired heading; if it's blocked,
+// fan out alternating angles until a clear one is found so lurkers slide along walls
+// instead of jittering/rubber-banding into them. Returns a unit heading.
+function feel(l, dx, dy) {
+  const LOOK = 34;
+  if (!circleBlocked(l.x + dx * LOOK, l.y + dy * LOOK, CFG.lurkerR)) return [dx, dy];
+  const base = Math.atan2(dy, dx);
+  for (const off of [0.5, -0.5, 1.0, -1.0, 1.6, -1.6]) {
+    const a = base + off, nx = Math.cos(a), ny = Math.sin(a);
+    if (!circleBlocked(l.x + nx * LOOK, l.y + ny * LOOK, CFG.lurkerR)) return [nx, ny];
+  }
+  return [-dx, -dy];   // boxed in — back out
+}
+// March a segment through the grid; false if any rock blocks it. Used to occlude the
+// gate beacon so it can't be seen through walls — the hum (audio) stays unoccluded.
+function hasLOS(x1, y1, x2, y2) {
+  const d = dist(x1, y1, x2, y2), steps = Math.ceil(d / 6);
+  for (let i = 1; i < steps; i++) {
+    if (isWallPx(x1 + (x2 - x1) * i / steps, y1 + (y2 - y1) * i / steps)) return false;
+  }
+  return true;
+}
+
+/* ---------------- AUDIO — all synthesized ---------------- */
+const Snd = {
+  ctx: null, master: null, humG: null, humPan: null, growlG: null, noiseBuf: null, _s: 0,
+  muted: localStorage.getItem('fathom_mute') === '1',
+  init() {
+    if (this.ctx) return;
+    const A = this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    this.master = A.createGain();
+    this.master.gain.value = this.muted ? 0 : 0.5;
+    this.master.connect(A.destination);
+    // ambience: looped brown-ish noise through a lowpass
+    const buf = A.createBuffer(1, A.sampleRate * 2, A.sampleRate);
+    const d = buf.getChannelData(0);
+    let last = 0;
+    for (let i = 0; i < d.length; i++) { const w = Math.random() * 2 - 1; last = (last + 0.02 * w) / 1.02; d[i] = last * 3; }
+    this.noiseBuf = buf;
+    const src = A.createBufferSource(); src.buffer = buf; src.loop = true;
+    const lp = A.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 160;
+    const g = A.createGain(); g.gain.value = 0.35;
+    src.connect(lp).connect(g).connect(this.master); src.start();
+    // gate hum: two detuned sines, gain by proximity + stereo pan toward the gate's
+    // bearing each frame — this is how you navigate to the exit by ear.
+    const h1 = A.createOscillator(); h1.type = 'sine'; h1.frequency.value = 54;
+    const h2 = A.createOscillator(); h2.type = 'sine'; h2.frequency.value = 81.5;
+    this.humG = A.createGain(); this.humG.gain.value = 0;
+    this.humPan = A.createStereoPanner ? A.createStereoPanner() : null;
+    if (this.humPan) { h1.connect(this.humG); h2.connect(this.humG); this.humG.connect(this.humPan).connect(this.master); }
+    else { h1.connect(this.humG); h2.connect(this.humG); this.humG.connect(this.master); }
+    h1.start(); h2.start();
+    // lurker growl: low saw through lowpass, proximity gain
+    const gr = A.createOscillator(); gr.type = 'sawtooth'; gr.frequency.value = 42;
+    const gf = A.createBiquadFilter(); gf.type = 'lowpass'; gf.frequency.value = 90;
+    this.growlG = A.createGain(); this.growlG.gain.value = 0;
+    gr.connect(gf).connect(this.growlG); this.growlG.connect(this.master); gr.start();
+  },
+  tone(f0, f1, dur, type = 'sine', vol = 0.2) {
+    if (!this.ctx) return;
+    const A = this.ctx, t = A.currentTime;
+    const o = A.createOscillator(), g = A.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(Math.max(1, f0), t);
+    o.frequency.exponentialRampToValueAtTime(Math.max(1, f1), t + dur);
+    g.gain.setValueAtTime(vol, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g).connect(this.master);
+    o.start(t); o.stop(t + dur + 0.02);
+  },
+  noise(dur = 0.2, vol = 0.4) {
+    if (!this.ctx) return;
+    const A = this.ctx, t = A.currentTime;
+    const s = A.createBufferSource(); s.buffer = this.noiseBuf;
+    const g = A.createGain();
+    g.gain.setValueAtTime(vol, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    s.connect(g).connect(this.master);
+    s.start(t); s.stop(t + dur);
+  },
+  ping()    { this.tone(720, 170, 0.5, 'sine', 0.28); this.tone(58, 42, 0.5, 'sine', 0.22); },
+  blip()    { this.tone(430, 940, 0.14, 'sine', 0.18); },
+  screech() { const n = performance.now(); if (n - this._s < 350) return; this._s = n;
+              this.tone(130, 58, 0.34, 'sawtooth', 0.14); },
+  hit()     { this.noise(0.25, 0.5); this.tone(90, 38, 0.3, 'sine', 0.4); },
+  descend() { this.tone(180, 50, 1.1, 'sine', 0.3); this.tone(54, 30, 1.4, 'sine', 0.3); },
+  death()   { this.tone(240, 32, 1.6, 'sine', 0.32); this.noise(0.8, 0.25); },
+  warn()    { this.tone(880, 870, 0.07, 'sine', 0.07); },
+  toggleMute() {
+    this.muted = !this.muted;
+    localStorage.setItem('fathom_mute', this.muted ? '1' : '0');
+    if (this.master) this.master.gain.value = this.muted ? 0 : 0.5;
+  },
+  prox(dGate, dLurk, bearingX) {
+    if (!this.ctx) return;
+    // hum: audible across most of the map, faint when far and swelling as you close in,
+    // panned toward the gate so you can hear which way to go.
+    const near = clamp(1 - dGate / CFG.gateHumRange, 0, 1);
+    this.humG.gain.value = (0.012 + Math.pow(near, 2.2) * 0.12);
+    if (this.humPan) this.humPan.pan.value = clamp(bearingX / 900, -1, 1);
+    this.growlG.gain.value = Math.pow(clamp(1 - dLurk / 300, 0, 1), 1.5) * 0.14;
+  },
+  silence() { if (this.ctx) { this.humG.gain.value = 0; this.growlG.gain.value = 0; } },
+};
+
+/* ---------------- PER-ZONE MODIFIERS — one tweak each, shown on the banner ---------------- */
+const MODS = [
+  { n: 'DENSE FAUNA',   d: 'more hunters in the dark',       dL:  2, dB:  0, o2: 1    },
+  { n: 'STILL WATER',   d: 'the fauna runs sparse here',     dL: -2, dB:  0, o2: 1    },
+  { n: 'RICH VENT',     d: 'oxygen blooms are plentiful',    dL:  0, dB:  3, o2: 1    },
+  { n: 'THIN AIR',      d: 'you arrive already short of air', dL: 0, dB: -2, o2: 0.6  },
+  { n: 'FEEDING SWARM', d: 'dense fauna, thinning oxygen',   dL:  2, dB: -1, o2: 0.85 },
+];
+
+/* ---------------- BIOMES — identity shifts every 3 zones (palette + params) ---------------- */
+// bg is the void color; tint washes the whole frame faintly; no NEW accents (guardrail) —
+// the locked cyan/gold/red stay, only the darkness around them changes character.
+const BIOMES = [
+  { n: 'THE ABYSSAL PLAIN', bg: '#02070a', tint: null,               fill: 0.46, lurkMul: 1.0,  fadeMul: 1.0,  vents: false, listener: false },
+  { n: 'THE HYDROTHERMAL',  bg: '#0a0704', tint: 'rgba(255,193,94,0.045)', fill: 0.44, lurkMul: 1.12, fadeMul: 1.18, vents: true,  listener: true  },
+  { n: 'THE HOLLOW',        bg: '#01040b', tint: 'rgba(20,60,90,0.05)',    fill: 0.40, lurkMul: 1.22, fadeMul: 1.34, vents: true,  listener: true  },
+];
+function biomeFor(lvl) { return BIOMES[Math.min(BIOMES.length - 1, Math.floor((lvl - 1) / 3))]; }
+
+/* ---------------- SONAR-LOG — one flavor line between zones ---------------- */
+const LOGS = [
+  'pressure hull creaks. the dark does not.',
+  'something large changed heading below.',
+  'the water tastes of iron here.',
+  'contact lost. contact lost. contact lost.',
+  'the hum is closer than the map says.',
+  'no light has ever reached this deep.',
+  'your own ping comes back wrong.',
+  'the fauna stopped fleeing three zones ago.',
+  'depth gauge disagrees with the pressure.',
+  'something is listening.',
+];
+
+/* ---------------- MAP GENERATION — cellular automata caves ---------------- */
+function carve(idx, r) {
+  const cx = idx % gw, cy = (idx / gw) | 0;
+  for (let y = cy - r; y <= cy + r; y++) for (let x = cx - r; x <= cx + r; x++) {
+    if (x < 2 || y < 2 || x >= gw - 2 || y >= gh - 2) continue;
+    if ((x - cx) ** 2 + (y - cy) ** 2 <= r * r + 1) grid[y * gw + x] = 0;
+  }
+}
+function cellCenter(idx) { return { x: (idx % gw) * T + T / 2, y: ((idx / gw) | 0) * T + T / 2 }; }
+
+function genLevel(depth) {
+  biome = biomeFor(depth);
+  gw = CFG.mapW + depth * 4; gh = CFG.mapH + depth * 3;
+  grid = new Uint8Array(gw * gh);
+  for (let y = 0; y < gh; y++) for (let x = 0; x < gw; x++) {
+    const border = x < 2 || y < 2 || x >= gw - 2 || y >= gh - 2;
+    grid[y * gw + x] = (border || Math.random() < biome.fill) ? 1 : 0;
+  }
+  for (let it = 0; it < CFG.smoothIters; it++) {
+    const ng = new Uint8Array(grid);
+    for (let y = 1; y < gh - 1; y++) for (let x = 1; x < gw - 1; x++) {
+      let n = 0;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++)
+        if (dx || dy) n += grid[(y + dy) * gw + x + dx];
+      ng[y * gw + x] = n > 4 ? 1 : n < 4 ? 0 : grid[y * gw + x];
+    }
+    grid = ng;
+  }
+  for (let y = 0; y < gh; y++) for (let x = 0; x < gw; x++)
+    if (x < 2 || y < 2 || x >= gw - 2 || y >= gh - 2) grid[y * gw + x] = 1;
+
+  // keep only the largest open region
+  const label = new Int32Array(gw * gh).fill(-1);
+  let bestLbl = -1, bestSize = 0, nl = 0;
+  const stack = [];
+  for (let i = 0; i < gw * gh; i++) {
+    if (grid[i] || label[i] >= 0) continue;
+    let size = 0; stack.length = 0; stack.push(i); label[i] = nl;
+    while (stack.length) {
+      const j = stack.pop(); size++;
+      const x = j % gw, y = (j / gw) | 0;
+      for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1]]) {
+        const nx = x + dx, ny = y + dy;
+        if (nx < 0 || ny < 0 || nx >= gw || ny >= gh) continue;
+        const k = ny * gw + nx;
+        if (!grid[k] && label[k] < 0) { label[k] = nl; stack.push(k); }
+      }
+    }
+    if (size > bestSize) { bestSize = size; bestLbl = nl; }
+    nl++;
+  }
+  for (let i = 0; i < gw * gh; i++) if (!grid[i] && label[i] !== bestLbl) grid[i] = 1;
+
+  // spawn: topmost open cell, biased to horizontal center
+  let sIdx = -1, sScore = 1e18;
+  for (let y = 2; y < gh - 2; y++) for (let x = 2; x < gw - 2; x++) {
+    const i = y * gw + x;
+    if (grid[i]) continue;
+    const score = y * 1000 + Math.abs(x - gw / 2);
+    if (score < sScore) { sScore = score; sIdx = i; }
+  }
+  carve(sIdx, 3);
+
+  // BFS from spawn: distances drive gate, bubble and lurker placement
+  distMap = new Int32Array(gw * gh).fill(-1);
+  const q = [sIdx]; distMap[sIdx] = 0;
+  let qi = 0, far = sIdx;
+  while (qi < q.length) {
+    const j = q[qi++];
+    const x = j % gw, y = (j / gw) | 0;
+    for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1]]) {
+      const nx = x + dx, ny = y + dy;
+      if (nx < 0 || ny < 0 || nx >= gw || ny >= gh) continue;
+      const k = ny * gw + nx;
+      if (!grid[k] && distMap[k] < 0) {
+        distMap[k] = distMap[j] + 1;
+        if (distMap[k] > distMap[far]) far = k;
+        q.push(k);
+      }
+    }
+  }
+  const maxD = Math.max(1, distMap[far]);
+
+  // gate: among the farthest cells, prefer the deepest (largest y)
+  let gIdx = far;
+  for (let i = 0; i < gw * gh; i++)
+    if (distMap[i] >= maxD * 0.88 && ((i / gw) | 0) > ((gIdx / gw) | 0)) gIdx = i;
+  carve(gIdx, 2);
+
+  spawn = cellCenter(sIdx);
+  const gc = cellCenter(gIdx);
+  gatePos = { x: gc.x, y: gc.y, lit: 0, ringT: 0, rings: [] };
+
+  // per-zone modifier (never on zone 1 — let the first dive read clean)
+  const mod = (depth > 1 && Math.random() < 0.7) ? MODS[(Math.random() * MODS.length) | 0] : null;
+  modName = mod ? mod.n : ''; modDesc = mod ? mod.d : '';
+  const bubbleCount = Math.max(1, CFG.bubbles + (mod ? mod.dB : 0));
+  const lurkCount = Math.min(14, Math.max(1, CFG.lurkersBase + depth + (mod ? mod.dL : 0)));
+  const startO2 = CFG.o2Max * (mod ? mod.o2 : 1);
+
+  bubbles = [];
+  let tries = 0;
+  while (bubbles.length < bubbleCount && tries++ < 4000) {
+    const i = (Math.random() * gw * gh) | 0;
+    if (grid[i] || distMap[i] < maxD * 0.15 || distMap[i] > maxD * 0.95) continue;
+    const c = cellCenter(i);
+    if (bubbles.some(b => dist(b.x, b.y, c.x, c.y) < 220)) continue;
+    bubbles.push({ x: c.x, y: c.y, lit: 0, seed: Math.random() * 7 });
+  }
+
+  // hull-patch: at most one per zone, rare, placed out past the halfway mark (a real detour)
+  patches = [];
+  if (Math.random() < CFG.hullPatchChance) {
+    tries = 0;
+    while (tries++ < 3000) {
+      const i = (Math.random() * gw * gh) | 0;
+      if (grid[i] || distMap[i] < maxD * 0.4 || distMap[i] > maxD * 0.9) continue;
+      const c = cellCenter(i);
+      patches.push({ x: c.x, y: c.y, lit: 0, seed: Math.random() * 7 });
+      break;
+    }
+  }
+
+  lurkers = [];
+  tries = 0;
+  while (lurkers.length < lurkCount && tries++ < 6000) {
+    const i = (Math.random() * gw * gh) | 0;
+    if (grid[i] || distMap[i] < maxD * 0.2) continue;
+    const c = cellCenter(i);
+    if (dist(c.x, c.y, spawn.x, spawn.y) < 320) continue;
+    lurkers.push({ x: c.x, y: c.y, vx: 0, vy: 0, wander: Math.random() * TAU,
+                   alertT: 0, tx: 0, ty: 0, lit: 0, seed: Math.random() * 9 });
+  }
+
+  // THE LISTENER — a stationary insta-kill presence placed on the mid-path, well away
+  // from spawn and gate. You must cross its radius WITHOUT pinging (blind traversal).
+  listener = null;
+  if (biome.listener && Math.random() < CFG.listenerChance) {
+    tries = 0;
+    while (tries++ < 3000) {
+      const i = (Math.random() * gw * gh) | 0;
+      if (grid[i] || distMap[i] < maxD * 0.35 || distMap[i] > maxD * 0.8) continue;
+      const c = cellCenter(i);
+      if (dist(c.x, c.y, spawn.x, spawn.y) < CFG.listenerR + 340) continue;
+      if (dist(c.x, c.y, gatePos.x, gatePos.y) < CFG.listenerR + 120) continue;
+      listener = { x: c.x, y: c.y, r: CFG.listenerR, seed: Math.random() * 9 };
+      break;
+    }
+  }
+
+  // CURRENT VENTS — push zones (hydrothermal & below)
+  vents = [];
+  if (biome.vents) {
+    const nv = 2 + depth % 2;
+    tries = 0;
+    while (vents.length < nv && tries++ < 3000) {
+      const i = (Math.random() * gw * gh) | 0;
+      if (grid[i] || distMap[i] < maxD * 0.12) continue;
+      const c = cellCenter(i);
+      if (dist(c.x, c.y, spawn.x, spawn.y) < 260) continue;
+      if (vents.some(v => dist(v.x, v.y, c.x, c.y) < 260)) continue;
+      vents.push({ x: c.x, y: c.y, ang: Math.random() * TAU, seed: Math.random() * 9 });
+    }
+  }
+
+  // BRITTLE CEILINGS — wall cells that drop rock a beat after a ping lights them
+  brittleCells = new Set(); rockfalls = [];
+  if (depth > 2) {
+    const nb = 10 + depth * 2;
+    tries = 0;
+    while (brittleCells.size < nb && tries++ < 4000) {
+      const gx = 2 + ((Math.random() * (gw - 4)) | 0), gy = 2 + ((Math.random() * (gh - 4)) | 0);
+      const i = gy * gw + gx;
+      // a ceiling cell = wall with open space directly below it (rock can fall onto the player)
+      if (grid[i] && !grid[i + gw]) brittleCells.add(i);
+    }
+  }
+
+  litCells.clear();
+  pings.length = 0; pops.length = 0; wake.length = 0;
+  decoyList = []; gateEcho = null;
+  flares = CFG.flaresPerZone; decoys = CFG.decoysPerZone;
+  player = { x: spawn.x, y: spawn.y, vx: 0, vy: 0 };
+  cam.x = player.x; cam.y = player.y;
+  o2 = startO2; cdT = 0; levelT = 0; msgT = 2.6; autoPinged = false;
+  initSnow();
+}
+
+/* ---------------- SONAR PINGS — raycast on creation, reveal on crossing ---------------- */
+function firePing(x, y, ambient = false, maxR = CFG.pingMaxR) {
+  const N = CFG.pingRays;
+  const hits = new Float32Array(N), idxs = new Int32Array(N), done = new Uint8Array(N);
+  for (let i = 0; i < N; i++) {
+    const a = i / N * TAU, dx = Math.cos(a), dy = Math.sin(a);
+    let d = 12, hit = 1e9, hi = -1;
+    while (d < maxR) {
+      const px = x + dx * d, py = y + dy * d;
+      if (isWallPx(px, py)) { hit = d; hi = cellIdx(px, py); break; }
+      d += 5;
+    }
+    hits[i] = hit; idxs[i] = hi;
+  }
+  pings.push({ x, y, r: 0, hits, idxs, done, ambient, noAggro: false, maxR });
+  if (!ambient) Snd.ping();
+  return pings[pings.length - 1];
+}
+// the gate answers a sonar ping with a directional bearing return (works muted too)
+function pingGateEcho() {
+  if (state !== 'play') return;
+  gateEcho = { ang: Math.atan2(gatePos.y - player.y, gatePos.x - player.x), t: 0 };
+}
+function tryPing() {
+  if (cdT > 0) return;
+  cdT = CFG.pingCooldown;
+  pingsUsed++;
+  firePing(player.x, player.y);
+  pingGateEcho();
+  checkListener();
+}
+// pinging inside a Listener's radius wakes it — instant death (its shape flashes as you die)
+function checkListener() {
+  if (listener && dist(player.x, player.y, listener.x, listener.y) < listener.r) {
+    listener.hit = 1;
+    shake = reduced ? 0 : 22;
+    Snd.tone(150, 28, 1.5, 'sawtooth', 0.4); Snd.noise(1.0, 0.3);
+    die('THE LISTENER HEARD YOU');
+  }
+}
+function alertLurker(l, x, y) {
+  l.alertT = CFG.alertTime;
+  l.tx = x; l.ty = y;
+  l.lit = Math.max(l.lit, 0.6);
+  pops.push({ x: l.x, y: l.y, t: 0, max: 90, col: COL.danger });
+  Snd.screech();
+}
+// FLARE (F): a double-reach ping — you see far, but the whole map hears it and hunts you.
+function fireFlare() {
+  if (flares <= 0 || cdT > 0 || state !== 'play' || paused) return;
+  flares--; cdT = CFG.pingCooldown; pingsUsed++;
+  firePing(player.x, player.y, false, CFG.pingMaxR * CFG.flareRadiusMul);
+  pingGateEcho();
+  for (const l of lurkers) alertLurker(l, player.x, player.y);   // every lurker on the map
+  flashT = 0.6;
+  checkListener();   // a flare inside the Listener is just as fatal
+}
+// DECOY (E): drop a pinger where you are; it pings on a timer and lurkers mob it, not you.
+function dropDecoy() {
+  if (decoys <= 0 || state !== 'play' || paused) return;
+  decoys--;
+  decoyList.push({ x: player.x, y: player.y, t: 0, pingT: 0.25 });
+  Snd.blip();
+}
+function updateDecoys(dt) {
+  for (let i = decoyList.length - 1; i >= 0; i--) {
+    const dc = decoyList[i];
+    dc.t += dt; dc.pingT -= dt;
+    if (dc.pingT <= 0) { dc.pingT = CFG.decoyPingEvery; firePing(dc.x, dc.y); }  // aggros lurkers to the decoy
+    if (dc.t > CFG.decoyLife) decoyList.splice(i, 1);
+  }
+}
+// brittle-ceiling collapses: a warn/creak beat, then rock drops and can crush the sub
+function updateRockfalls(dt) {
+  for (let i = rockfalls.length - 1; i >= 0; i--) {
+    const rf = rockfalls[i];
+    if (rf.warn > 0) {
+      rf.warn -= dt;
+      if (rf.warn <= 0) { rf.vy = 30; Snd.tone(90, 40, 0.45, 'sawtooth', 0.18); }
+      continue;
+    }
+    rf.t += dt; rf.vy += 360 * dt; rf.y += rf.vy * dt;
+    if (iframeT <= 0 && dist(rf.x, rf.y, player.x, player.y) < CFG.brittleDmgR + CFG.playerR) {
+      hull--; iframeT = CFG.iframes; shake = reduced ? 0 : 12; hitstop = reduced ? 0 : 0.05; Snd.hit();
+      pops.push({ x: player.x, y: player.y, t: 0, max: 52, col: COL.danger });
+      rockfalls.splice(i, 1);
+      if (hull <= 0) die('CRUSHED');
+      continue;
+    }
+    if (rf.t > 1.2 || isWallPx(rf.x, rf.y)) rockfalls.splice(i, 1);
+  }
+}
+function updatePings(dt, live) {
+  for (let pi = pings.length - 1; pi >= 0; pi--) {
+    const p = pings[pi];
+    const rPrev = p.r;
+    p.r += CFG.pingSpeed * dt;
+    const N = p.hits.length;
+    for (let i = 0; i < N; i++) {
+      if (!p.done[i] && p.r >= p.hits[i]) {
+        p.done[i] = 1;
+        const idx = p.idxs[i];
+        if (idx >= 0) {
+          litCells.set(idx, 1);
+          if (live && brittleCells.has(idx)) {   // lighting a brittle ceiling arms its collapse
+            brittleCells.delete(idx);
+            const gx = idx % gw, gy = (idx / gw) | 0;
+            rockfalls.push({ x: gx * T + T / 2, y: gy * T + T, t: 0, warn: CFG.brittleFallDelay });
+          }
+        }
+      }
+    }
+    const crossed = (ex, ey) => {
+      const d = dist(p.x, p.y, ex, ey);
+      if (!(d > rPrev && d <= p.r)) return false;
+      let ai = Math.round(Math.atan2(ey - p.y, ex - p.x) / TAU * N);
+      ai = ((ai % N) + N) % N;
+      return p.hits[ai] > d - 10;   // line-of-sight: the ray must reach past the entity
+    };
+    if (crossed(gatePos.x, gatePos.y)) gatePos.lit = 1;
+    for (const b of bubbles) if (crossed(b.x, b.y)) b.lit = 1;
+    for (const pt of patches) if (crossed(pt.x, pt.y)) pt.lit = 1;
+    for (const l of lurkers) if (crossed(l.x, l.y)) {
+      l.lit = Math.max(l.lit, 1);
+      if (!p.ambient && !p.noAggro && live) alertLurker(l, p.x, p.y);
+    }
+    if (p.r >= p.maxR) pings.splice(pi, 1);
+  }
+}
+
+/* ---------------- SNOW (marine dust — depth cue) ---------------- */
+function initSnow() {
+  snow = [];
+  const n = reduced ? 60 : 150;
+  for (let i = 0; i < n; i++)
+    snow.push({ x: cam.x + (Math.random() - 0.5) * W * 1.2,
+                y: cam.y + (Math.random() - 0.5) * H * 1.2,
+                s: Math.random() * 5 + 3, seed: Math.random() * 9 });
+}
+function updateSnow(dt) {
+  for (const s of snow) {
+    s.y += s.s * dt;
+    s.x += Math.sin(TIME * 0.6 + s.seed) * 2 * dt;
+    if (s.x < cam.x - W * 0.6) s.x += W * 1.2;
+    if (s.x > cam.x + W * 0.6) s.x -= W * 1.2;
+    if (s.y < cam.y - H * 0.6) s.y += H * 1.2;
+    if (s.y > cam.y + H * 0.6) s.y -= H * 1.2;
+  }
+}
+
+/* ---------------- RUN / STATE MANAGEMENT ---------------- */
+function startRun() {
+  level = 1; hull = CFG.hull; pingsUsed = 0;
+  logText = ''; logT = 0;          // no stale sonar-log on the first zone
+  genLevel(level);
+  state = 'play'; paused = false;
+}
+function nextLevel() {
+  level++;
+  hull = Math.min(CFG.hull, hull + 1);
+  const depthM = level * 150;
+  if (depthM > bestDepth) { bestDepth = depthM; localStorage.setItem('fathom_best', bestDepth); }
+  Snd.descend();
+  genLevel(level);
+  flashT = 1;
+  logText = LOGS[(Math.random() * LOGS.length) | 0]; logT = 5;   // sonar-log flavor line
+}
+function die(cause) {
+  state = 'dead'; deathCause = cause; deathT = 0;
+  const depthM = level * 150;
+  const prevBest = bestDepth;              // capture before we overwrite it
+  newBest = depthM > prevBest;             // a genuine beat, not a tie
+  if (depthM > bestDepth) { bestDepth = depthM; localStorage.setItem('fathom_best', bestDepth); }
+  Snd.death(); Snd.silence();
+  shake = reduced ? 0 : 18;
+}
+
+/* ---------------- UPDATE ---------------- */
+function updatePlay(dt) {
+  levelT += dt;
+  // one free orientation ping at zone start — reveals but does NOT wake lurkers
+  // (spawning already-hunted is unfair; every player-initiated ping still costs aggro)
+  if (!autoPinged && levelT > 0.4) { autoPinged = true; firePing(player.x, player.y).noAggro = true; pingGateEcho(); }
+
+  // player thrust
+  let ix = (keys.d ? 1 : 0) - (keys.a ? 1 : 0);
+  let iy = (keys.s ? 1 : 0) - (keys.w ? 1 : 0);
+  if (ix && iy) { ix *= 0.7071; iy *= 0.7071; }
+  player.vx += ix * CFG.accel * dt;
+  player.vy += iy * CFG.accel * dt;
+  // current vents shove the sub off course
+  for (const v of vents) {
+    const d = dist(v.x, v.y, player.x, player.y);
+    if (d < CFG.ventR) {
+      const f = (1 - d / CFG.ventR) * CFG.ventStrength * dt;
+      player.vx += Math.cos(v.ang) * f; player.vy += Math.sin(v.ang) * f;
+    }
+  }
+  const dr = Math.exp(-CFG.drag * dt);
+  player.vx *= dr; player.vy *= dr;
+  const spd = Math.hypot(player.vx, player.vy);
+  if (spd > CFG.maxSpeed) { player.vx *= CFG.maxSpeed / spd; player.vy *= CFG.maxSpeed / spd; }
+  moveCollide(player, CFG.playerR, dt);
+  if ((ix || iy) && Math.random() < dt * 16)
+    wake.push({ x: player.x - (player.vx / (spd || 1)) * 11 + (Math.random() - 0.5) * 6,
+                y: player.y - (player.vy / (spd || 1)) * 11 + (Math.random() - 0.5) * 6, t: 0 });
+
+  // full thrust is loud — nearby lurkers hear you
+  noiseT -= dt;
+  if (noiseT <= 0) {
+    noiseT = 0.35;
+    if (spd > CFG.maxSpeed * 0.78)
+      for (const l of lurkers)
+        if (dist(l.x, l.y, player.x, player.y) < CFG.noiseRadius && l.alertT <= 0)
+          alertLurker(l, player.x, player.y);
+  }
+
+  // oxygen
+  o2 -= dt;
+  if (o2 < 18) { warnT -= dt; if (warnT <= 0) { warnT = 1.6; Snd.warn(); } }
+  if (o2 <= 0) { o2 = 0; die('OXYGEN DEPLETED'); return; }
+
+  // timers
+  cdT = Math.max(0, cdT - dt);
+  iframeT = Math.max(0, iframeT - dt);
+  msgT = Math.max(0, msgT - dt);
+  flashT = Math.max(0, flashT - dt);
+
+  // lurkers
+  let nearestLurk = 1e9;
+  for (const l of lurkers) {
+    l.lit = Math.max(0, l.lit - dt / 2.4);
+    let dx, dy, sp;
+    if (l.alertT > 0) {
+      l.alertT -= dt;
+      const dp = dist(l.x, l.y, player.x, player.y);
+      if (dp < 150) { l.tx = player.x; l.ty = player.y; l.alertT = Math.max(l.alertT, 1.2); }
+      dx = l.tx - l.x; dy = l.ty - l.y;
+      const dd = Math.hypot(dx, dy) || 1;
+      if (dd < 14 && dp >= 150) l.alertT = 0;
+      dx /= dd; dy /= dd;
+      sp = (CFG.lurkerAlertSpeed + level * 6) * biome.lurkMul;
+    } else {
+      l.wander += (Math.random() - 0.5) * 2.6 * dt * 60 * 0.04;
+      dx = Math.cos(l.wander); dy = Math.sin(l.wander);
+      sp = CFG.lurkerSpeed * 0.55 * biome.lurkMul;
+    }
+    [dx, dy] = feel(l, dx, dy);           // steer along walls instead of into them
+    const st = 1 - Math.exp(-3.2 * dt);
+    l.vx = lerp(l.vx, dx * sp, st);
+    l.vy = lerp(l.vy, dy * sp, st);
+    const ox = l.x, oy = l.y;
+    moveCollide(l, CFG.lurkerR, dt);
+    if (Math.abs(l.x - ox) < 0.02 && Math.abs(l.y - oy) < 0.02 && l.alertT <= 0)
+      l.wander = Math.random() * TAU;
+
+    const dp2 = dist(l.x, l.y, player.x, player.y);
+    nearestLurk = Math.min(nearestLurk, dp2);
+    if (iframeT <= 0 && dp2 < CFG.playerR + CFG.lurkerR) {
+      hull--; iframeT = CFG.iframes;
+      shake = reduced ? 0 : 14;
+      hitstop = reduced ? 0 : 0.06;   // 60ms freeze — the hit lands
+      Snd.hit();
+      const ang = Math.atan2(player.y - l.y, player.x - l.x);
+      player.vx = Math.cos(ang) * 340; player.vy = Math.sin(ang) * 340;
+      l.alertT = 0; l.vx = -Math.cos(ang) * 120; l.vy = -Math.sin(ang) * 120;
+      pops.push({ x: player.x, y: player.y, t: 0, max: 60, col: COL.danger });
+      if (hull <= 0) { die('HULL BREACH'); return; }
+    }
+  }
+
+  // bubbles (O2 pickups)
+  for (let i = bubbles.length - 1; i >= 0; i--) {
+    const b = bubbles[i];
+    b.lit = Math.max(0, b.lit - dt / 3);
+    if (dist(b.x, b.y, player.x, player.y) < CFG.playerR + 10) {
+      o2 = Math.min(CFG.o2Max, o2 + CFG.o2PerBubble);
+      pops.push({ x: b.x, y: b.y, t: 0, max: 40, col: COL.gold });
+      Snd.blip();
+      bubbles.splice(i, 1);
+    }
+  }
+
+  // hull-patch pickups (restore 1 hull)
+  for (let i = patches.length - 1; i >= 0; i--) {
+    const pt = patches[i];
+    pt.lit = Math.max(0, pt.lit - dt / 3);
+    if (dist(pt.x, pt.y, player.x, player.y) < CFG.playerR + 11) {
+      hull = Math.min(CFG.hull, hull + 1);
+      pops.push({ x: pt.x, y: pt.y, t: 0, max: 48, col: COL.sonar });
+      Snd.tone(320, 620, 0.22, 'sine', 0.22);
+      patches.splice(i, 1);
+    }
+  }
+
+  updateDecoys(dt);
+  updateRockfalls(dt);
+  // inside a Listener's radius: a low ominous pulse warns you by ear NOT to ping (fair, blind)
+  if (listener && dist(player.x, player.y, listener.x, listener.y) < listener.r) {
+    lWarnT -= dt; if (lWarnT <= 0) { lWarnT = 0.75; Snd.tone(66, 52, 0.55, 'sine', 0.13); }
+  } else lWarnT = 0;
+  if (gateEcho) { gateEcho.t += dt; if (gateEcho.t > 1.3) gateEcho = null; }
+  if (logT > 0) logT -= dt;
+
+  // gate
+  gatePos.lit = Math.max(0, gatePos.lit - dt * 0.12);
+  gatePos.ringT -= dt;
+  if (gatePos.ringT <= 0) { gatePos.ringT = 4.5; gatePos.rings.push({ r: 0 }); }
+  for (let i = gatePos.rings.length - 1; i >= 0; i--) {
+    gatePos.rings[i].r += 55 * dt;
+    if (gatePos.rings[i].r > 150) gatePos.rings.splice(i, 1);
+  }
+  if (dist(gatePos.x, gatePos.y, player.x, player.y) < 30) { nextLevel(); return; }
+
+  updatePings(dt, true);
+  decayWorld(dt);
+  updateSnow(dt);
+
+  // wake bubbles
+  for (let i = wake.length - 1; i >= 0; i--) {
+    wake[i].t += dt; wake[i].y -= 14 * dt;
+    if (wake[i].t > 0.6) wake.splice(i, 1);
+  }
+
+  // camera with velocity lookahead
+  const ct = 1 - Math.exp(-5 * dt);
+  cam.x = lerp(cam.x, player.x + player.vx * 0.22, ct);
+  cam.y = lerp(cam.y, player.y + player.vy * 0.22, ct);
+  shake *= Math.exp(-6 * dt);
+
+  Snd.prox(dist(gatePos.x, gatePos.y, player.x, player.y), nearestLurk, gatePos.x - player.x);
+}
+
+function decayWorld(dt) {
+  const fade = CFG.litFade * (biome ? biome.fadeMul : 1);
+  for (const [i, v] of litCells) {
+    const nv = v - dt * fade;
+    if (nv <= 0.02) litCells.delete(i); else litCells.set(i, nv);
+  }
+  for (let i = pops.length - 1; i >= 0; i--) {
+    pops[i].t += dt;
+    if (pops[i].t > 0.45) pops.splice(i, 1);
+  }
+}
+
+function updateAmbient(dt) {
+  // title / death: world breathes but nothing hunts
+  if (state === 'title') {
+    titlePingT -= dt;
+    if (titlePingT <= 0) {
+      titlePingT = 2.4;
+      for (let tries = 0; tries < 40; tries++) {
+        const i = (Math.random() * gw * gh) | 0;
+        if (!grid[i]) { const c = cellCenter(i); firePing(c.x, c.y, true); break; }
+      }
+    }
+    cam.x = lerp(cam.x, spawn.x + Math.sin(TIME * 0.13) * 160, 0.02);
+    cam.y = lerp(cam.y, spawn.y + 120 + Math.cos(TIME * 0.09) * 90, 0.02);
+  }
+  if (state === 'dead') deathT += dt;
+  updatePings(dt, false);
+  decayWorld(dt);
+  updateSnow(dt);
+  shake *= Math.exp(-6 * dt);
+}
+
+/* ---------------- RENDER ---------------- */
+let vignette = null;
+function makeVignette() {
+  vignette = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.28, W / 2, H / 2, Math.max(W, H) * 0.72);
+  vignette.addColorStop(0, 'rgba(0,0,0,0)');
+  vignette.addColorStop(1, 'rgba(0,0,0,0.62)');
+}
+
+function renderWorld() {
+  const sx = (Math.random() - 0.5) * shake, sy = (Math.random() - 0.5) * shake;
+  ctx.save();
+  ctx.translate(W / 2 - cam.x + sx, H / 2 - cam.y + sy);
+
+  // hull proximity light — dim, silent, arm's-reach awareness of walls right around the sub.
+  // Paid for by proximity (not a ping), so it never aggros; reveals nothing beyond touch range.
+  if (state === 'play') {
+    const R = CFG.hullLightR, pgx = (player.x / T) | 0, pgy = (player.y / T) | 0, span = ((R / T) | 0) + 1;
+    ctx.lineWidth = 1.2;
+    for (let gy = pgy - span; gy <= pgy + span; gy++) {
+      for (let gx = pgx - span; gx <= pgx + span; gx++) {
+        if (!isWallCell(gx, gy)) continue;
+        const nx = clamp(player.x, gx * T, gx * T + T), ny = clamp(player.y, gy * T, gy * T + T);
+        const d = Math.hypot(player.x - nx, player.y - ny);
+        if (d > R) continue;
+        const a = (1 - d / R) * 0.7, x = gx * T, y = gy * T;
+        ctx.fillStyle = `rgba(${COL.rock},${(a * 0.16).toFixed(3)})`;
+        ctx.fillRect(x, y, T, T);
+        ctx.strokeStyle = `rgba(${COL.edge},${(a * 0.6).toFixed(3)})`;
+        ctx.beginPath();
+        if (!isWallCell(gx, gy - 1)) { ctx.moveTo(x, y); ctx.lineTo(x + T, y); }
+        if (!isWallCell(gx, gy + 1)) { ctx.moveTo(x, y + T); ctx.lineTo(x + T, y + T); }
+        if (!isWallCell(gx - 1, gy)) { ctx.moveTo(x, y); ctx.lineTo(x, y + T); }
+        if (!isWallCell(gx + 1, gy)) { ctx.moveTo(x + T, y); ctx.lineTo(x + T, y + T); }
+        ctx.stroke();
+      }
+    }
+  }
+
+  // lit cave contours
+  ctx.lineWidth = 1.5;
+  for (const [i, v] of litCells) {
+    const gx = i % gw, gy = (i / gw) | 0;
+    const x = gx * T, y = gy * T;
+    const a = Math.max(0, v);
+    ctx.fillStyle = `rgba(${COL.rock},${(a * 0.16).toFixed(3)})`;
+    ctx.fillRect(x, y, T, T);
+    ctx.strokeStyle = `rgba(${COL.edge},${(a * 0.85).toFixed(3)})`;
+    ctx.beginPath();
+    if (!isWallCell(gx, gy - 1)) { ctx.moveTo(x, y); ctx.lineTo(x + T, y); }
+    if (!isWallCell(gx, gy + 1)) { ctx.moveTo(x, y + T); ctx.lineTo(x + T, y + T); }
+    if (!isWallCell(gx - 1, gy)) { ctx.moveTo(x, y); ctx.lineTo(x, y + T); }
+    if (!isWallCell(gx + 1, gy)) { ctx.moveTo(x + T, y); ctx.lineTo(x + T, y + T); }
+    ctx.stroke();
+  }
+
+  // current vents — flowing streaks along the push direction (felt by proximity, or ping-lit)
+  for (const v of vents) {
+    const near = clamp(1 - dist(v.x, v.y, player.x, player.y) / (CFG.ventR * 1.7), 0, 1);
+    const li = litCells.get(cellIdx(v.x, v.y)) || 0;
+    const a = Math.max(near * 0.5, li * 0.6);
+    if (a <= 0.02) continue;
+    const ca = Math.cos(v.ang), sa = Math.sin(v.ang), px = Math.cos(v.ang + Math.PI / 2), py = Math.sin(v.ang + Math.PI / 2);
+    ctx.strokeStyle = `rgba(${COL.sonar},${(a * 0.6).toFixed(3)})`;
+    ctx.lineWidth = 1.4;
+    for (let s = 0; s < 5; s++) {
+      const ph = (TIME * 95 + s * 30 + v.seed * 40) % 150;
+      const off = (s - 2) * 11;
+      const bx = v.x - ca * 75 + px * off, by = v.y - sa * 75 + py * off;
+      const x0 = bx + ca * ph, y0 = by + sa * ph;
+      ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x0 + ca * 12, y0 + sa * 12); ctx.stroke();
+    }
+  }
+
+  // brittle rockfalls — creak telegraph, then falling debris
+  for (const rf of rockfalls) {
+    if (rf.warn > 0) {
+      const a = 0.4 + Math.sin(TIME * 30) * 0.3;
+      ctx.strokeStyle = `rgba(${COL.danger},${(a * 0.5).toFixed(3)})`;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(rf.x, rf.y - 7); ctx.lineTo(rf.x - 4, rf.y + 1);
+      ctx.moveTo(rf.x, rf.y - 7); ctx.lineTo(rf.x + 5, rf.y);
+      ctx.stroke();
+    } else {
+      ctx.strokeStyle = `rgba(${COL.danger},0.9)`;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(rf.x - 5, rf.y); ctx.lineTo(rf.x + 3, rf.y - 5); ctx.lineTo(rf.x + 6, rf.y + 3); ctx.lineTo(rf.x - 2, rf.y + 6); ctx.closePath();
+      ctx.stroke();
+    }
+  }
+
+  // gate beacon — occluded by rock (you navigate to it by the hum, not by sight)
+  const gateSeen = state === 'title' || hasLOS(gatePos.x, gatePos.y, player.x, player.y);
+  const occ = gateSeen ? 1 : 0.12;
+  const gl = (0.16 + gatePos.lit * 0.8) * occ;
+  for (const r of gatePos.rings) {
+    const a = Math.max(0, (1 - r.r / 150)) * 0.25 * (0.4 + gatePos.lit) * occ;
+    ctx.strokeStyle = `rgba(${COL.gold},${a.toFixed(3)})`;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(gatePos.x, gatePos.y, r.r, 0, TAU); ctx.stroke();
+  }
+  ctx.strokeStyle = `rgba(${COL.gold},${gl.toFixed(3)})`;
+  ctx.lineWidth = 2;
+  for (let i = 0; i < 3; i++) {
+    ctx.beginPath();
+    ctx.arc(gatePos.x, gatePos.y, 10 + i * 7, TIME * (0.6 + i * 0.2), TIME * (0.6 + i * 0.2) + TAU * 0.62);
+    ctx.stroke();
+  }
+  ctx.fillStyle = `rgba(${COL.gold},${(gl * 0.9).toFixed(3)})`;
+  ctx.beginPath(); ctx.arc(gatePos.x, gatePos.y, 4, 0, TAU); ctx.fill();
+
+  // bubbles
+  for (const b of bubbles) {
+    const prox = clamp(1 - dist(b.x, b.y, player.x, player.y) / 95, 0, 1) * 0.5;
+    const a = Math.max(b.lit * 0.9, prox);
+    if (a <= 0.01) continue;
+    const bob = Math.sin(TIME * 2 + b.seed) * 2;
+    ctx.strokeStyle = `rgba(${COL.gold},${a.toFixed(3)})`;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(b.x, b.y + bob, 7, 0, TAU); ctx.stroke();
+    ctx.fillStyle = `rgba(255,255,255,${(a * 0.7).toFixed(3)})`;
+    ctx.beginPath(); ctx.arc(b.x - 2, b.y + bob - 2, 1.6, 0, TAU); ctx.fill();
+  }
+
+  // hull-patch pickups — a cyan diamond with a cross (reads as "repair")
+  for (const pt of patches) {
+    const prox = clamp(1 - dist(pt.x, pt.y, player.x, player.y) / 95, 0, 1) * 0.5;
+    const a = Math.max(pt.lit * 0.9, prox);
+    if (a <= 0.01) continue;
+    const bob = Math.sin(TIME * 2 + pt.seed) * 2;
+    ctx.save();
+    ctx.translate(pt.x, pt.y + bob);
+    ctx.strokeStyle = `rgba(${COL.sonar},${a.toFixed(3)})`;
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    ctx.moveTo(0, -8); ctx.lineTo(8, 0); ctx.lineTo(0, 8); ctx.lineTo(-8, 0); ctx.closePath(); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(-3.5, 0); ctx.lineTo(3.5, 0); ctx.moveTo(0, -3.5); ctx.lineTo(0, 3.5); ctx.stroke();
+    ctx.restore();
+  }
+
+  // decoy pingers — a small pulsing cyan node lurkers are drawn to
+  for (const dc of decoyList) {
+    const pulse = 0.4 + Math.sin(TIME * 8) * 0.3;
+    ctx.strokeStyle = `rgba(${COL.sonar},${(0.6 * pulse).toFixed(3)})`;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(dc.x, dc.y, 5, 0, TAU); ctx.stroke();
+    ctx.fillStyle = `rgba(${COL.sonar},${pulse.toFixed(3)})`;
+    ctx.beginPath(); ctx.arc(dc.x, dc.y, 2, 0, TAU); ctx.fill();
+  }
+
+  // lurkers
+  for (const l of lurkers) {
+    const d = dist(l.x, l.y, player.x, player.y);
+    const sense = d < CFG.senseR ? (1 - d / CFG.senseR) * 0.13 : 0;
+    const a = Math.max(l.lit, sense);
+    if (a <= 0.01) continue;
+    const ang = Math.atan2(l.vy, l.vx);
+    ctx.save();
+    ctx.translate(l.x, l.y);
+    ctx.rotate(ang);
+    const hot = l.alertT > 0;
+    ctx.strokeStyle = `rgba(${COL.danger},${(a * (hot ? 1 : 0.7)).toFixed(3)})`;
+    ctx.fillStyle = `rgba(${COL.danger},${(a * 0.14).toFixed(3)})`;
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    ctx.moveTo(11, 0);
+    ctx.quadraticCurveTo(0, 8, -12, 3);
+    ctx.quadraticCurveTo(-16, 0, -12, -3);
+    ctx.quadraticCurveTo(0, -8, 11, 0);
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+    for (let i = 0; i < 3; i++) {
+      const off = (i - 1) * 3.4;
+      ctx.beginPath();
+      ctx.moveTo(-12, off);
+      ctx.quadraticCurveTo(-20, off + Math.sin(TIME * 6 + l.seed + i) * 4, -27, off + Math.sin(TIME * 5 + l.seed + i * 2) * 6);
+      ctx.stroke();
+    }
+    ctx.fillStyle = hot ? `rgba(255,40,20,${a.toFixed(3)})` : `rgba(${COL.gold},${(a * 0.9).toFixed(3)})`;
+    ctx.beginPath(); ctx.arc(5, 0, 2.2, 0, TAU); ctx.fill();
+    ctx.restore();
+  }
+
+  // pops / telegraph rings
+  for (const p of pops) {
+    const k = p.t / 0.45;
+    ctx.strokeStyle = `rgba(${p.col},${((1 - k) * 0.5).toFixed(3)})`;
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(p.x, p.y, k * p.max, 0, TAU); ctx.stroke();
+  }
+
+  // wake bubbles
+  for (const wk of wake) {
+    const a = (1 - wk.t / 0.6) * 0.3;
+    ctx.fillStyle = `rgba(${COL.sonar},${a.toFixed(3)})`;
+    ctx.beginPath(); ctx.arc(wk.x, wk.y, 1.6, 0, TAU); ctx.fill();
+  }
+
+  // player
+  if (state !== 'title') {
+    const blink = iframeT > 0 && Math.sin(TIME * 40) > 0;
+    const pa = blink ? 0.35 : 1;
+    const glow = ctx.createRadialGradient(player.x, player.y, 2, player.x, player.y, 72);
+    glow.addColorStop(0, 'rgba(120,220,205,0.10)');
+    glow.addColorStop(1, 'rgba(120,220,205,0)');
+    ctx.fillStyle = glow;
+    ctx.beginPath(); ctx.arc(player.x, player.y, 72, 0, TAU); ctx.fill();
+
+    const va = Math.atan2(player.vy, player.vx);
+    const moving = Math.hypot(player.vx, player.vy) > 12;
+    ctx.save();
+    ctx.translate(player.x, player.y);
+    if (moving) ctx.rotate(va);
+    ctx.strokeStyle = `rgba(230,255,250,${(0.95 * pa).toFixed(3)})`;
+    ctx.fillStyle = `rgba(${COL.sonar},${(0.18 * pa).toFixed(3)})`;
+    ctx.lineWidth = 1.8;
+    ctx.beginPath();
+    ctx.moveTo(9, 0);
+    ctx.quadraticCurveTo(2, 7, -7, 4);
+    ctx.lineTo(-10, 0);
+    ctx.lineTo(-7, -4);
+    ctx.quadraticCurveTo(2, -7, 9, 0);
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = `rgba(${COL.sonar},${pa.toFixed(3)})`;
+    ctx.beginPath(); ctx.arc(2.5, 0, 2, 0, TAU); ctx.fill();
+    ctx.restore();
+
+    // ping cooldown arc
+    if (cdT > 0 && state === 'play') {
+      const f = 1 - cdT / CFG.pingCooldown;
+      ctx.strokeStyle = `rgba(${COL.sonar},0.5)`;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.arc(player.x, player.y, 15, -Math.PI / 2, -Math.PI / 2 + TAU * f); ctx.stroke();
+    }
+
+    // gate bearing echo — the gate's directional sonar return, spent by a ping (works muted)
+    if (gateEcho && state === 'play') {
+      const k = Math.max(0, 1 - gateEcho.t / 1.3), ang = gateEcho.ang;
+      const R = 52 + (1 - k) * 20;
+      const px = player.x, py = player.y, perp = ang + Math.PI / 2;
+      const ca = Math.cos(ang), sa = Math.sin(ang), cp = Math.cos(perp), sp = Math.sin(perp);
+      // faint arc segment (the return sweeping in from the gate's bearing)
+      ctx.strokeStyle = `rgba(${COL.gold},${(k * 0.5).toFixed(3)})`;
+      ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(px, py, R, ang - 0.36, ang + 0.36); ctx.stroke();
+      // bold chevron pointing at the gate
+      ctx.strokeStyle = `rgba(${COL.gold},${(k * 0.95).toFixed(3)})`;
+      ctx.lineWidth = 2.6;
+      ctx.lineJoin = 'round';
+      const ex = px + ca * (R + 11), ey = py + sa * (R + 11);
+      ctx.beginPath();
+      ctx.moveTo(px + ca * R + cp * 8, py + sa * R + sp * 8);
+      ctx.lineTo(ex, ey);
+      ctx.lineTo(px + ca * R - cp * 8, py + sa * R - sp * 8);
+      ctx.stroke();
+    }
+  }
+
+  // sonar wavefronts — clipped to first wall hit per ray (the signature visual)
+  for (const p of pings) {
+    const N = p.hits.length;
+    const k = p.ambient ? 0.4 : 1;
+    const a = Math.pow(Math.max(0, 1 - p.r / p.maxR), 1.35) * k;
+    if (a <= 0.005) continue;
+    ctx.beginPath();
+    for (let i = 0; i <= N; i++) {
+      const j = i % N;
+      const ang = j / N * TAU, ca = Math.cos(ang), sa = Math.sin(ang);
+      let rr = Math.min(p.r, p.hits[j]);
+      let x = p.x + ca * rr, y = p.y + sa * rr;
+      // The Listener distorts sonar: any return passing near it breaks up. This ripple is the
+      // ONLY tell of its kill-radius — ping from outside to spot it, then cross it blind.
+      if (listener) {
+        const dl = Math.hypot(x - listener.x, y - listener.y), edge = listener.r * 1.3;
+        if (dl < edge) {
+          const w = 1 - dl / edge;
+          rr += (Math.sin(ang * 15 + TIME * 9 + listener.seed) * 34 + Math.sin(ang * 33 + TIME * 13) * 14) * w;
+          x = p.x + ca * rr; y = p.y + sa * rr;
+        }
+      }
+      if (i) ctx.lineTo(x, y); else ctx.moveTo(x, y);
+    }
+    ctx.closePath();
+    ctx.fillStyle = `rgba(${COL.sonar},${(a * 0.035).toFixed(3)})`;
+    ctx.fill();
+    ctx.lineJoin = 'round';
+    // soft bloom under the crisp edge — makes the advancing front glow and read as a ring
+    ctx.strokeStyle = `rgba(${COL.edge},${(a * 0.28).toFixed(3)})`;
+    ctx.lineWidth = 4;
+    ctx.stroke();
+    ctx.strokeStyle = `rgba(${COL.edge},${(a * 0.7).toFixed(3)})`;
+    ctx.lineWidth = 1.75;
+    ctx.stroke();
+  }
+
+  // The Listener revealed — only when it just killed you: a vast concentric maw
+  if (listener && listener.hit) {
+    ctx.fillStyle = `rgba(${COL.danger},0.13)`;
+    ctx.beginPath(); ctx.arc(listener.x, listener.y, listener.r, 0, TAU); ctx.fill();
+    for (let i = 0; i < 6; i++) {
+      ctx.strokeStyle = `rgba(${COL.danger},${(0.55 - i * 0.07).toFixed(3)})`;
+      ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(listener.x, listener.y, listener.r * (0.22 + i * 0.15) + Math.sin(TIME * 3 + i) * 4, 0, TAU); ctx.stroke();
+    }
+  }
+
+  // marine snow
+  for (const s of snow) {
+    let a = 0.05;
+    const dp = dist(s.x, s.y, player.x, player.y);
+    if (dp < 110) a += (1 - dp / 110) * 0.3;
+    for (const p of pings) {
+      const e = Math.abs(dist(s.x, s.y, p.x, p.y) - p.r);
+      if (e < 50) a += (1 - e / 50) * 0.4 * Math.max(0, 1 - p.r / p.maxR);
+    }
+    ctx.fillStyle = `rgba(190,235,225,${clamp(a, 0, 0.6).toFixed(3)})`;
+    ctx.fillRect(s.x, s.y, 1.5, 1.5);
+  }
+
+  ctx.restore();
+}
+
+function mono(size, weight = 400) { return `${weight} ${size}px "Cascadia Mono", ui-monospace, Consolas, monospace`; }
+function disp(size, weight = 700) { return `${weight} ${size}px Technor, "Segoe UI", sans-serif`; }
+function setLS(v) { if ('letterSpacing' in ctx) ctx.letterSpacing = v; }
+
+function renderHUD() {
+  ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+  setLS('1px');
+  // depth
+  ctx.fillStyle = `rgba(${COL.hud},0.9)`;
+  ctx.font = disp(20, 500);
+  ctx.fillText(`−${level * 150}m`, 20, 34);
+  ctx.font = mono(10);
+  ctx.fillStyle = `rgba(${COL.hud},0.5)`;
+  ctx.fillText(`ZONE ${level}`, 20, 48);
+  // O2
+  const low = o2 < 18;
+  const o2c = low ? COL.danger : COL.sonar;
+  const pulse = low ? 0.55 + Math.sin(TIME * 6) * 0.3 : 0.8;
+  ctx.fillStyle = `rgba(${COL.hud},0.5)`;
+  ctx.fillText('O2', 20, 66);
+  ctx.strokeStyle = `rgba(${COL.hud},0.3)`;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(40, 58, 150, 7);
+  ctx.fillStyle = `rgba(${o2c},${pulse.toFixed(3)})`;
+  ctx.fillRect(41, 59, 148 * clamp(o2 / CFG.o2Max, 0, 1), 5);
+  // hull
+  ctx.fillStyle = `rgba(${COL.hud},0.5)`;
+  ctx.fillText('HULL', 20, 84);
+  for (let i = 0; i < CFG.hull; i++) {
+    ctx.save();
+    ctx.translate(58 + i * 16, 80);
+    ctx.rotate(Math.PI / 4);
+    if (i < hull) { ctx.fillStyle = `rgba(${COL.sonar},0.85)`; ctx.fillRect(-3.5, -3.5, 7, 7); }
+    else { ctx.strokeStyle = `rgba(${COL.hud},0.35)`; ctx.strokeRect(-3.5, -3.5, 7, 7); }
+    ctx.restore();
+  }
+  // consumables — flares (F) and decoys (E)
+  ctx.font = mono(10);
+  ctx.fillStyle = `rgba(${COL.hud},${flares > 0 ? 0.75 : 0.28})`;
+  ctx.fillText(`[F] FLARE ×${flares}`, 20, 104);
+  ctx.fillStyle = `rgba(${COL.hud},${decoys > 0 ? 0.75 : 0.28})`;
+  ctx.fillText(`[E] DECOY ×${decoys}`, 20, 118);
+  // top right
+  ctx.textAlign = 'right';
+  ctx.font = mono(10);
+  ctx.fillStyle = `rgba(${COL.hud},0.5)`;
+  if (bestDepth > 0) ctx.fillText(`BEST −${bestDepth}m`, W - 20, 30);
+  ctx.fillText(`[M] ${Snd.muted ? 'MUTED' : 'SOUND'}`, W - 20, 46);
+  // controls hint
+  if (level === 1 && levelT < 9) {
+    const a = clamp(9 - levelT, 0, 1) * 0.55;
+    ctx.textAlign = 'center';
+    ctx.fillStyle = `rgba(${COL.hud},${a.toFixed(3)})`;
+    ctx.fillText('WASD thrust   ·   SPACE / CLICK ping   ·   F flare   ·   E decoy   ·   P pause', W / 2, H - 26);
+  }
+  // zone message + biome + per-zone modifier
+  if (msgT > 0) {
+    const a = clamp(msgT, 0, 1);
+    ctx.textAlign = 'center';
+    ctx.font = disp(15, 500);
+    setLS('4px');
+    ctx.fillStyle = `rgba(${COL.hud},${(a * 0.85).toFixed(3)})`;
+    ctx.fillText(`ZONE ${level} — ${biome.n}`, W / 2, 40);
+    if (modName) {
+      ctx.font = mono(11);
+      setLS('3px');
+      ctx.fillStyle = `rgba(${COL.gold},${(a * 0.8).toFixed(3)})`;
+      ctx.fillText(`${modName} — ${modDesc}`, W / 2, 60);
+    }
+    setLS('1px');
+  }
+  // sonar-log flavor line (fades over its last second)
+  if (logT > 0 && logText) {
+    ctx.textAlign = 'center';
+    ctx.font = mono(11);
+    setLS('2px');
+    ctx.fillStyle = `rgba(${COL.hud},${(clamp(logT, 0, 1) * 0.5).toFixed(3)})`;
+    ctx.fillText(`◈ ${logText}`, W / 2, H - 52);
+    setLS('0px');
+  }
+  setLS('0px');
+}
+
+function renderTitle() {
+  ctx.fillStyle = 'rgba(1,4,6,0.55)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center';
+  const cx = W / 2, cy = H * 0.4;
+  setLS('10px');
+  ctx.font = disp(Math.min(W * 0.13, 120), 700);
+  ctx.fillStyle = 'rgba(234,255,250,0.96)';
+  ctx.fillText('FATHOM', cx, cy);
+  setLS('4px');
+  ctx.font = mono(12);
+  ctx.fillStyle = `rgba(${COL.sonar},0.75)`;
+  ctx.fillText('A  SONAR  DESCENT', cx, cy + 34);
+  setLS('0px');
+  ctx.font = mono(11);
+  ctx.fillStyle = `rgba(${COL.hud},0.55)`;
+  ctx.fillText('the deep is black. sound is your only light —', cx, cy + 78);
+  ctx.fillText('and every ping wakes something that heard it.', cx, cy + 94);
+  const pulse = 0.45 + Math.sin(TIME * 2.2) * 0.3;
+  ctx.font = mono(13);
+  ctx.fillStyle = `rgba(255,255,255,${pulse.toFixed(3)})`;
+  ctx.fillText('CLICK  TO  DIVE', cx, cy + 150);
+  if (bestDepth > 0) {
+    ctx.font = mono(11);
+    ctx.fillStyle = `rgba(${COL.gold},0.7)`;
+    ctx.fillText(`best descent  −${bestDepth}m`, cx, cy + 180);
+  }
+  ctx.font = mono(10);
+  ctx.fillStyle = `rgba(${COL.hud},0.35)`;
+  ctx.fillText('WASD thrust · SPACE ping · quiet drifting stays unheard · follow the hum', cx, H - 28);
+}
+
+function renderDead() {
+  ctx.fillStyle = 'rgba(0,2,3,0.7)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center';
+  const cx = W / 2, cy = H * 0.42;
+  setLS('6px');
+  ctx.font = disp(Math.min(W * 0.06, 46), 700);
+  ctx.fillStyle = `rgba(${COL.danger},0.95)`;
+  ctx.fillText(deathCause, cx, cy);
+  setLS('0px');
+  ctx.font = mono(13);
+  ctx.fillStyle = `rgba(${COL.hud},0.85)`;
+  ctx.fillText(`you sank to −${level * 150}m · ${pingsUsed} pings`, cx, cy + 40);
+  if (newBest) {
+    ctx.fillStyle = `rgba(${COL.gold},0.9)`;
+    ctx.fillText('NEW BEST DESCENT', cx, cy + 64);
+  }
+  if (deathT > 0.7) {
+    const pulse = 0.45 + Math.sin(TIME * 2.2) * 0.3;
+    ctx.font = mono(12);
+    ctx.fillStyle = `rgba(255,255,255,${pulse.toFixed(3)})`;
+    ctx.fillText('CLICK  TO  RESURFACE', cx, cy + 116);
+  }
+}
+
+function render() {
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = (biome && biome.bg) || '#02070a';   // the void shifts color by biome
+  ctx.fillRect(0, 0, W, H);
+  renderWorld();
+  ctx.fillStyle = vignette;
+  ctx.fillRect(0, 0, W, H);
+  if (biome && biome.tint) { ctx.fillStyle = biome.tint; ctx.fillRect(0, 0, W, H); }  // faint biome wash
+  if (flashT > 0) {
+    ctx.fillStyle = `rgba(${COL.sonar},${(flashT * 0.3).toFixed(3)})`;
+    ctx.fillRect(0, 0, W, H);
+  }
+  if (state === 'play') {
+    renderHUD();
+    if (paused) {
+      ctx.fillStyle = 'rgba(0,0,0,0.55)';
+      ctx.fillRect(0, 0, W, H);
+      ctx.textAlign = 'center';
+      ctx.font = mono(14);
+      ctx.fillStyle = `rgba(${COL.hud},0.9)`;
+      ctx.fillText('PAUSED — P to resume', W / 2, H / 2);
+    }
+  }
+  else if (state === 'title') renderTitle();
+  else if (state === 'dead') renderDead();
+}
+
+/* ---------------- LOOP ---------------- */
+let tPrev = performance.now();
+function frame(t) {
+  const dt = Math.min(0.05, (t - tPrev) / 1000);
+  tPrev = t;
+  TIME += dt;
+  if (hitstop > 0) { hitstop -= dt; render(); requestAnimationFrame(frame); return; }
+  if (!paused) {
+    if (state === 'play') updatePlay(dt);
+    else updateAmbient(dt);
+  }
+  render();
+  requestAnimationFrame(frame);
+}
+
+/* ---------------- INPUT ---------------- */
+function primaryAction() {
+  Snd.init();
+  if (Snd.ctx && Snd.ctx.state === 'suspended') Snd.ctx.resume();
+  if (state === 'title') startRun();
+  else if (state === 'dead' && deathT > 0.7) startRun();
+  else if (state === 'play' && !paused) tryPing();
+}
+addEventListener('pointerdown', primaryAction);
+addEventListener('contextmenu', e => e.preventDefault());
+addEventListener('keydown', e => {
+  if (KEYMAP[e.code]) { keys[KEYMAP[e.code]] = 1; e.preventDefault(); return; }
+  if (e.code === 'Space') { e.preventDefault(); primaryAction(); }
+  else if (e.code === 'KeyF') { e.preventDefault(); fireFlare(); }
+  else if (e.code === 'KeyE') { e.preventDefault(); dropDecoy(); }
+  else if (e.code === 'KeyM') Snd.toggleMute();
+  else if (e.code === 'KeyP' || e.code === 'Escape') { if (state === 'play') paused = !paused; }
+});
+addEventListener('keyup', e => { if (KEYMAP[e.code]) keys[KEYMAP[e.code]] = 0; });
+addEventListener('blur', () => { if (state === 'play') paused = true; });
+
+function resize() {
+  dpr = devicePixelRatio || 1;
+  W = innerWidth; H = innerHeight;
+  cv.width = W * dpr; cv.height = H * dpr;
+  makeVignette();
+}
+addEventListener('resize', resize);
+
+/* ---------------- BOOT ---------------- */
+resize();
+genLevel(1);            // backdrop world for the title screen
+state = 'title';
+if (document.fonts && document.fonts.load) document.fonts.load('700 100px Technor');
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
