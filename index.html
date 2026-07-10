@@ -30,10 +30,10 @@ const CFG = {
   pingSpeed: 470, pingMaxR: 680, pingCooldown: 0.9, pingRays: 280,
   litFade: 0.4,                // lit contour fade per second
   o2Max: 75, o2PerBubble: 20, bubbles: 7,
-  lurkersBase: 3, lurkerSpeed: 100, lurkerAlertSpeed: 172, lurkerR: 11,
-  alertTime: 5, senseR: 165,   // distance at which you faintly feel a lurker
+  lurkersBase: 3, lurkerSpeed: 100, lurkerAlertSpeed: 164, lurkerR: 11,
+  alertTime: 4.2, senseR: 165, // distance at which you faintly feel a lurker
   hull: 3, iframes: 1.3,
-  noiseRadius: 150,            // full-thrust movement wakes lurkers this close
+  noiseRadius: 135,            // full-thrust movement wakes lurkers this close
   gateHumRange: 2200,         // gate hum audible within this (directional, pans to bearing)
   // Phase 2 — consumables & pickups
   flaresPerZone: 1, flareRadiusMul: 1.9,   // flare = double-reach ping that wakes the whole map
@@ -686,7 +686,11 @@ function updatePlay(dt) {
     if (l.alertT > 0) {
       l.alertT -= dt;
       const dp = dist(l.x, l.y, player.x, player.y);
-      if (dp < 150) { l.tx = player.x; l.ty = player.y; l.alertT = Math.max(l.alertT, 1.2); }
+      // a hunter only re-locks if you're loud (thrusting hard) or practically touching
+      // it — quiet drifting genuinely breaks the trail, as the title screen promises
+      if (dp < 150 && (spd > CFG.maxSpeed * 0.5 || dp < 55)) {
+        l.tx = player.x; l.ty = player.y; l.alertT = Math.max(l.alertT, 1.2);
+      }
       dx = l.tx - l.x; dy = l.ty - l.y;
       const dd = Math.hypot(dx, dy) || 1;
       if (dd < 14 && dp >= 150) l.alertT = 0;
