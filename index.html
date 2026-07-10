@@ -1322,7 +1322,7 @@ function render() {
    The observation layout here must stay byte-identical to fathom-rl's env. */
 const Auto = {
   on: false, ready: false, layers: null, meta: null,
-  stack: [], acc: 0,
+  stack: [], acc: 0, visited: new Map(), lastLevel: 1,
   async load() {
     try {
       const r = await fetch('policy.json');
@@ -1337,7 +1337,7 @@ const Auto = {
     if (this.on) { this.reset(); if (state !== 'play') startRun(); }
     else keys.w = keys.a = keys.s = keys.d = 0;
   },
-  reset() { this.stack = []; this.acc = 0; },
+  reset() { this.stack = []; this.acc = 0; this.visited = new Map(); this.lastLevel = level; },
   observe() {
     const o = new Float32Array(this.meta.obs_dim_single);
     let i = 0;
@@ -1415,6 +1415,21 @@ const Auto = {
       o[i + 2] = Math.cos(a); o[i + 3] = Math.sin(a);
     }
     i += 4;
+    // own-trail memory (only for policies trained with it)
+    if (this.meta.trail_rays) {
+      const nS = Math.max(1, Math.floor(this.meta.trail_range / T));
+      for (let k = 0; k < this.meta.trail_rays; k++) {
+        const a = k / this.meta.trail_rays * TAU, dx = Math.cos(a), dy = Math.sin(a);
+        let acc = 0;
+        for (let s = 1; s <= nS; s++) {
+          const idx = cellIdx(player.x + dx * s * T, player.y + dy * s * T);
+          if (idx >= 0) acc += this.visited.get(idx) || 0;
+        }
+        o[i++] = acc / nS;
+      }
+      const vi = cellIdx(player.x, player.y);
+      o[i++] = vi >= 0 ? (this.visited.get(vi) || 0) : 0;
+    }
     return o;
   },
   forward(x) {
@@ -1437,6 +1452,10 @@ const Auto = {
     this.acc += dt;
     if (this.acc < this.meta.dt) return;    // decide at the training tick rate
     this.acc %= this.meta.dt;
+    // maintain the trail memory at the training tick rate
+    if (level !== this.lastLevel) { this.visited.clear(); this.lastLevel = level; }
+    const vi = cellIdx(player.x, player.y);
+    if (vi >= 0) this.visited.set(vi, Math.min(1, (this.visited.get(vi) || 0) + this.meta.dt / 2));
     const f = this.observe();
     if (!this.stack.length) for (let k = 0; k < this.meta.frame_stack; k++) this.stack.push(f);
     this.stack.shift(); this.stack.push(f);
