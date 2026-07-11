@@ -20,6 +20,11 @@ Or any static server (`npx serve .`), or open `index.html` directly — there ar
 | Space / click | Sonar ping |
 | P / Esc | Pause |
 | M | Mute |
+| B | Autopilot — a trained agent flies the sub (see below) |
+
+## Watch the AI play
+
+Press **B** to hand the sub to a neural network that learned to play from scratch — it steers to the gate by ear, spends sonar only when it's genuinely lost, and dives as deep as it can. It's a PPO agent trained by self-play in a headless port of this exact game; the trained weights ship here as `policy.json`. Write-up, training curves, and code: [fathom-rl](https://github.com/nadim-hamade/fathom-rl).
 
 ## Design constraints
 
@@ -27,4 +32,4 @@ The premise is protected by three rules: all art is procedural and all audio syn
 
 ## Status
 
-Playable MVP — the core descent loop (ping-to-see, oxygen, lurkers, exit-gate hum) is complete and verified in the browser. Palette is three locked accents on near-black; targets 60fps with no per-frame allocations in the update path.
+Playable — the descent loop (ping-to-see, oxygen, lurkers, exit-gate hum), consumables, biomes, and deep-zone hazards are complete and verified in the browser, plus a trained-agent autopilot. Palette is three locked accents on near-black; targets 60fps with no per-frame allocations in the update path.
