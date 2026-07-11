@@ -1462,8 +1462,13 @@ const Auto = {
     const x = new Float32Array(this.meta.obs_dim);
     this.stack.forEach((fr, j) => x.set(fr, j * this.meta.obs_dim_single));
     const logits = this.forward(x);
-    let a = 0;
-    for (let j = 1; j < logits.length; j++) if (logits[j] > logits[a]) a = j;
+    // sample from the policy instead of argmax — argmax suppresses every action
+    // that is wanted but never dominant (sonar, items) and stalls in loops
+    let mx = -Infinity, sum = 0;
+    for (let j = 0; j < logits.length; j++) if (logits[j] > mx) mx = logits[j];
+    for (let j = 0; j < logits.length; j++) sum += Math.exp(logits[j] - mx);
+    let r = Math.random() * sum, a = logits.length - 1;
+    for (let j = 0; j < logits.length; j++) { r -= Math.exp(logits[j] - mx); if (r <= 0) { a = j; break; } }
     keys.w = keys.a = keys.s = keys.d = 0;
     if (a >= 1 && a <= 8) {
       const ang = (a - 1) / 8 * TAU;
